@@ -16,6 +16,9 @@ app = Flask(
 )
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# ==================== DHT11 설정 ====================
+dht = adafruit_dht.DHT11(board.D2)
+
 # ==================== DB 설정 ====================
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://flask_user:1010@localhost/sensor_db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -51,9 +54,92 @@ class AlertLog(db.Model):
     temperature = db.Column(db.Float)
     humidity = db.Column(db.Float)
     detected_at = db.Column(db.DateTime, default=datetime.now)
+    
+# ==================== 차트 테이블 생성 ====================
+def create_stat_tables():
+    db.session.execute(text("""
+        CREATE TABLE IF NOT EXISTS hourly_stats (
+            record_date DATE NOT NULL,
+            record_hour INT NOT NULL,
+            avg_temp FLOAT,
+            avg_humidity FLOAT,
+            PRIMARY KEY (record_date, record_hour)
+        )
+    """))
 
-# ==================== DHT11 설정 ====================
-dht = adafruit_dht.DHT11(board.D2)
+    db.session.execute(text("""
+        CREATE TABLE IF NOT EXISTS daily_stats (
+            record_date DATE NOT NULL PRIMARY KEY,
+            avg_temp FLOAT,
+            avg_humidity FLOAT
+        )
+    """))
+
+    db.session.execute(text("""
+        CREATE TABLE IF NOT EXISTS monthly_stats (
+            record_year INT NOT NULL,
+            record_month INT NOT NULL,
+            avg_temp FLOAT,
+            avg_humidity FLOAT,
+            PRIMARY KEY (record_year, record_month)
+        )
+    """))
+
+    db.session.commit()
+
+# ==================== 차트 갱신 함수 ====================
+def update_hourly_stats():
+    db.session.execute(text("""
+        INSERT INTO hourly_stats (record_date, record_hour, avg_temp, avg_humidity)
+        SELECT
+            DATE(timestamp),
+            HOUR(timestamp),
+            ROUND(AVG(CASE WHEN sensor_type = 'temp' THEN value END), 1),
+            ROUND(AVG(CASE WHEN sensor_type = 'humidity' THEN value END), 1)
+        FROM sensor_data
+        GROUP BY DATE(timestamp), HOUR(timestamp)
+        ON DUPLICATE KEY UPDATE
+            avg_temp = VALUES(avg_temp),
+            avg_humidity = VALUES(avg_humidity)
+    """))
+    db.session.commit()
+
+def update_daily_stats():
+    db.session.execute(text("""
+        INSERT INTO daily_stats (record_date, avg_temp, avg_humidity)
+        SELECT
+            DATE(timestamp),
+            ROUND(AVG(CASE WHEN sensor_type = 'temp' THEN value END), 1),
+            ROUND(AVG(CASE WHEN sensor_type = 'humidity' THEN value END), 1)
+        FROM sensor_data
+        GROUP BY DATE(timestamp)
+        ON DUPLICATE KEY UPDATE
+            avg_temp = VALUES(avg_temp),
+            avg_humidity = VALUES(avg_humidity)
+    """))
+    db.session.commit()
+
+def update_monthly_stats():
+    db.session.execute(text("""
+        INSERT INTO monthly_stats (record_year, record_month, avg_temp, avg_humidity)
+        SELECT
+            YEAR(timestamp),
+            MONTH(timestamp),
+            ROUND(AVG(CASE WHEN sensor_type = 'temp' THEN value END), 1),
+            ROUND(AVG(CASE WHEN sensor_type = 'humidity' THEN value END), 1)
+        FROM sensor_data
+        GROUP BY YEAR(timestamp), MONTH(timestamp)
+        ON DUPLICATE KEY UPDATE
+            avg_temp = VALUES(avg_temp),
+            avg_humidity = VALUES(avg_humidity)
+    """))
+    db.session.commit()
+
+
+def update_all_stats():
+    update_hourly_stats()
+    update_daily_stats()
+    update_monthly_stats()
 
 # ==================== 센서 데이터 저장 ====================
 def save_sensor_data(sensor_type, value):
@@ -272,10 +358,6 @@ def serve_react():
     <p><a href="/alerts">/alerts</a> : 최근 경고 이력 조회</p>
     """
 
-@app.route('/<path:path>')
-def static_proxy(path):
-    return send_from_directory('frontend', path)
-
 # ==================== 최신 데이터 + 상태 판단 ====================
 @app.route('/data')
 def get_data():
@@ -354,11 +436,98 @@ def get_alerts():
         return pretty_json({
             "error": "경고 조회 실패"
         })
+   
+# ==================== 차트 날짜별 집계 ====================        
+@app.route('/chart/day')
+def chart_day():
+    try:
+        rows = db.session.execute(text("""
+            SELECT
+                HOUR(timestamp) AS record_hour,
+                ROUND(AVG(CASE WHEN sensor_type = 'temp' THEN value END), 1) AS avg_temp,
+                ROUND(AVG(CASE WHEN sensor_type = 'humidity' THEN value END), 1) AS avg_humidity
+            FROM sensor_data
+            WHERE DATE(timestamp) = CURDATE()
+            GROUP BY HOUR(timestamp)
+            ORDER BY record_hour
+        """)).fetchall()
+
+        return pretty_json({
+            "labels": [f"{int(r.record_hour)}:00" for r in rows],
+            "temp": [r.avg_temp for r in rows],
+            "humi": [r.avg_humidity for r in rows]
+        })
+
+    except Exception as e:
+        print("시간대별 차트 오류:", e)
+        return pretty_json({"error": "시간대별 차트 조회 실패"})
+
+
+@app.route('/chart/week')
+def chart_week():
+    try:
+        rows = db.session.execute(text("""
+            SELECT
+                YEAR(timestamp) AS record_year,
+                WEEK(timestamp, 1) AS record_week,
+                ROUND(AVG(CASE WHEN sensor_type = 'temp' THEN value END), 1) AS avg_temp,
+                ROUND(AVG(CASE WHEN sensor_type = 'humidity' THEN value END), 1) AS avg_humidity
+            FROM sensor_data
+            GROUP BY YEAR(timestamp), WEEK(timestamp, 1)
+            ORDER BY record_year, record_week
+            LIMIT 12
+        """)).fetchall()
+
+        return pretty_json({
+            "labels": [f"{int(r.record_year)}년 {int(r.record_week)}주차" for r in rows],
+            "temp": [r.avg_temp for r in rows],
+            "humi": [r.avg_humidity for r in rows]
+        })
+
+    except Exception as e:
+        print("주차별 차트 오류:", e)
+        return pretty_json({"error": "주차별 차트 조회 실패"})
+
+
+@app.route('/chart/month')
+def chart_month():
+    try:
+        update_monthly_stats()
+
+        rows = db.session.execute(text("""
+            SELECT record_year, record_month, avg_temp, avg_humidity
+            FROM monthly_stats
+            ORDER BY record_year, record_month
+            LIMIT 12
+        """)).fetchall()
+
+        return pretty_json({
+            "labels": [f"{r.record_year}-{str(r.record_month).zfill(2)}" for r in rows],
+            "temp": [r.avg_temp for r in rows],
+            "humi": [r.avg_humidity for r in rows]
+        })
+
+    except Exception as e:
+        print("월별 차트 오류:", e)
+        return pretty_json({"error": "월별 차트 조회 실패"})
+
+@app.route('/dashboard')
+def dashboard():
+    return send_from_directory(app.template_folder, 'index.html')
+
+
+@app.route('/<path:path>')
+def serve_react_routes(path):
+    if path.startswith("assets/"):
+        return send_from_directory("frontend", path)
+
+    return send_from_directory(app.template_folder, 'index.html')
 
 # ==================== 실행 ====================
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
+        create_stat_tables()
 
     sensor_thread = threading.Thread(target=sensor_collect_loop, daemon=True)
     sensor_thread.start()
